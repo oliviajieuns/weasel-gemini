@@ -104,30 +104,34 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_jsonl_or_json(path: Path) -> List[Dict[str, Any]]:
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
-        return []
-
-    try:
-        data = json.loads(text)
-        if isinstance(data, list):
+    with path.open("r", encoding="utf-8") as f:
+        first = f.read(1)
+        while first and first.isspace():
+            first = f.read(1)
+        if not first:
+            return []
+        f.seek(0)
+        if first == "[":
+            data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError(f"Expected a JSON list or JSONL file: {path}")
             return data
-        raise ValueError(f"Expected a JSON list or JSONL file: {path}")
-    except json.JSONDecodeError:
-        pass
 
-    records: List[Dict[str, Any]] = []
-    try:
-        for line in text.splitlines():
+        # JSONL: iterate physical (\n) lines only. text.splitlines() also splits
+        # on U+2028/U+2029/NEL, which are valid UNESCAPED characters inside
+        # ensure_ascii=False JSON strings — splitting on them shreds records.
+        records: List[Dict[str, Any]] = []
+        for lineno, line in enumerate(f, 1):
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 records.append(json.loads(line))
-        if records:
-            return records
-    except json.JSONDecodeError:
-        pass
-
-    raise ValueError(f"Expected a JSON list or JSONL file: {path}")
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid JSON on line {lineno} of {path}: {exc}"
+                ) from exc
+        return records
 
 
 def write_json(data: Any, path: Path, indent: int) -> None:
