@@ -252,11 +252,30 @@ def split_contiguous(indices: Sequence[int]) -> List[List[int]]:
 def group_trajectories(data: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     goal_to_indices: Dict[str, List[int]] = defaultdict(list)
 
+    unparseable = 0
     for idx, item in enumerate(data):
         user_prompt = get_user_prompt(item)
         if not user_prompt:
             continue
-        goal_to_indices[extract_goal(user_prompt)].append(idx)
+        goal = extract_goal(user_prompt)
+        if not goal or goal == "<NO_GOAL_FOUND>":
+            # Never let unparseable goals merge into one shared mega group:
+            # pairwise scoring is O(n^2) per group and unrelated tasks would
+            # distort each other's selection. Fall back to the source
+            # trajectory id (or a singleton per item).
+            tid = item.get("_traj_id") if isinstance(item, dict) else None
+            goal = (
+                f"<NO_GOAL_FOUND:traj#{tid}>" if tid is not None
+                else f"<NO_GOAL_FOUND:item#{idx}>"
+            )
+            unparseable += 1
+        goal_to_indices[goal].append(idx)
+
+    if unparseable:
+        print(
+            f"Warning: {unparseable} datapoints had no parseable '## Goal:'; "
+            "grouped by _traj_id/item instead of one shared empty-goal group."
+        )
 
     trajectories: List[Dict[str, Any]] = []
     for goal, indices in goal_to_indices.items():
@@ -434,7 +453,14 @@ def main() -> None:
 
     trajectories = group_trajectories(data)
     num_segments = sum(len(item["segments"]) for item in trajectories)
-    print(f"Found {len(trajectories)} distinct goals and {num_segments} trajectory segments")
+    largest_segment = max(
+        (len(seg) for item in trajectories for seg in item["segments"]), default=0
+    )
+    print(
+        f"Found {len(trajectories)} distinct goals and {num_segments} trajectory "
+        f"segments (largest segment: {largest_segment} steps; pairwise scoring "
+        "is O(n^2) per segment)"
+    )
 
     scorer = load_bert_scorer(args.model_type, args.device)
     per_item_scores: Dict[int, Dict[str, Any]] = {

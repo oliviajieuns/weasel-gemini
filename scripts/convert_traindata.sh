@@ -10,6 +10,11 @@
 #                          preserved) for training; subset it with
 #                          weasel.select_trajectories after selection.
 #
+# By default the converter drops timestamp-only duplicate trajectories and looping
+# trajectories (repeated identical tool call, no final answer); set
+# EXTRA_ARGS="--keep-duplicates --keep-loops" to disable. Answer-less trajectories
+# are kept (WEASEL selects per step) and only counted in the stats.
+#
 # Usage:
 #   bash scripts/convert_traindata.sh                       # both train_data/*.jsonl
 #   INPUTS="train_data/a.jsonl train_data/b.jsonl" bash scripts/convert_traindata.sh
@@ -38,6 +43,7 @@ echo "[convert] mode=$MODE  steps=$STEPS_OUT  traj=$TRAJ_OUT"
 ARGS=(--input $INPUTS --mode "$MODE" --stats-output "$STATS_OUT")
 [ "$MODE" != "traj" ] && ARGS+=(--steps-output "$STEPS_OUT")
 [ "$MODE" != "step" ] && ARGS+=(--traj-output "$TRAJ_OUT")
+[ -n "${EXTRA_ARGS:-}" ] && ARGS+=($EXTRA_ARGS)
 
 python -m weasel.convert_gemini "${ARGS[@]}" 2>&1 | tee logs/convert_traindata.log
 

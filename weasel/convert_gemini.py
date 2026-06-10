@@ -30,6 +30,15 @@ markers, grouped into trajectories by goal, with the action in the assistant
 
 Both outputs stream line-by-line, so the multi-GB export never loads fully into RAM.
 
+Data quality (see the "data quality" section below for details):
+  * goals are flattened to one line so prepare_scores' `## Goal:` regex captures
+    them in full (multi-line Gemini prompts otherwise truncate at the first
+    internal `\n#`, collapsing unrelated tasks into one mega trajectory group);
+  * timestamp-only duplicate trajectories and looping trajectories (repeated
+    identical tool call, no final answer) are dropped up front;
+  * answer-less trajectories are KEPT — selection is per step — and only
+    counted in the stats.
+
 Examples
 --------
   python -m weasel.convert_gemini \
@@ -55,8 +64,11 @@ Real-use trajectory training (mode b), optionally WEASEL-filtered:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -172,6 +184,119 @@ def clip(text: str, limit: int) -> str:
 EMPTY_OBS = "(no observation)"
 
 
+def normalize_goal(text: str) -> str:
+    """Flatten the goal to a single whitespace-normalized line.
+
+    Gemini user prompts often contain newlines and markdown headers (`# ...`).
+    Embedded verbatim after `## Goal:`, prepare_scores' GOAL_RE stops capturing
+    at the first internal `\\n#`, so the "goal" degenerates to the prompt
+    template's shared prefix and thousands of unrelated steps collapse into one
+    mega trajectory group — O(n^2) pairwise scoring blows up and selection is
+    distorted across tasks. One line keeps the full goal regex-safe."""
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+# --------------------------------------------------------------- data quality
+# Pre-filters applied per raw trajectory before conversion.
+#
+#  * KEPT: trajectories whose episode never ends in a final text answer. WEASEL
+#    selects per STEP, so intermediate tool-calling steps are valid training
+#    signal even without an episode-level answer; they are only counted in the
+#    stats (`no_final_answer`) for monitoring.
+#  * DROPPED (--keep-duplicates disables): re-runs identical to an earlier
+#    trajectory except for embedded timestamps. They add no signal and bias
+#    selection toward whatever task happened to be re-exported.
+#  * DROPPED (--keep-loops disables): looping trajectories — the same tool call
+#    repeated >= --loop-repeat-threshold times with no final answer (the
+#    failure cluster: 20+ tool calls, 0 success). Training on them teaches the
+#    loop itself.
+
+TIMESTAMP_RES = (
+    # ISO 8601 datetimes: 2026-06-10T12:34:56.789Z / 2026-06-10 12:34:56+09:00
+    re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"),
+    # bare dates and clock times
+    re.compile(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b"),
+    re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?\b"),
+    # unix epochs (s/ms/us/ns) in the 2020–2033 range
+    re.compile(r"\b1[6-9]\d{8}(?:\d{3}){0,3}\b"),
+)
+
+
+def strip_timestamps(text: str) -> str:
+    for pattern in TIMESTAMP_RES:
+        text = pattern.sub("<TS>", text)
+    return text
+
+
+def traj_signature(record: Dict[str, Any]) -> str:
+    """Content hash of a trajectory with timestamps masked, for deduplication."""
+    skeleton = {
+        "tools": tool_names(record),
+        "msgs": [
+            [
+                m.get("role"),
+                to_text(m.get("content")),
+                to_text(m.get("reasoning_content")),
+                [
+                    [
+                        (tc.get("function", {}) or {}).get("name", ""),
+                        _args_to_text((tc.get("function", {}) or {}).get("arguments", {})),
+                    ]
+                    for tc in (m.get("tool_calls") or [])
+                    if isinstance(tc, dict)
+                ],
+            ]
+            for m in record.get("messages") or []
+            if isinstance(m, dict)
+        ],
+    }
+    raw = strip_timestamps(json.dumps(skeleton, ensure_ascii=False, sort_keys=True))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def final_answer_text(messages: List[Dict[str, Any]]) -> str:
+    """Text of the closing assistant answer, or "" if the episode ends mid-loop
+    (on a tool call / tool result) without one."""
+    for m in reversed(messages):
+        role = m.get("role")
+        if role == "tool":
+            return ""
+        if role == "assistant":
+            if m.get("tool_calls"):
+                return ""
+            return to_text(m.get("content")).strip()
+    return ""
+
+
+def max_repeated_tool_call(messages: List[Dict[str, Any]]) -> int:
+    """Highest occurrence count of one identical (name, arguments) tool call."""
+    counts: Counter = Counter()
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            counts[(fn.get("name", ""), _args_to_text(fn.get("arguments", {})))] += 1
+    return max(counts.values(), default=0)
+
+
+def count_tool_calls(messages: List[Dict[str, Any]]) -> int:
+    return sum(len(m.get("tool_calls") or []) for m in messages if m.get("role") == "assistant")
+
+
+def is_looping(messages: List[Dict[str, Any]], repeat_threshold: int, max_tool_calls: int) -> bool:
+    """A trajectory loops when it never reaches a final answer AND either repeats
+    one identical tool call >= repeat_threshold times or exceeds the optional
+    hard cap on total tool calls."""
+    if final_answer_text(messages):
+        return False
+    if repeat_threshold > 0 and max_repeated_tool_call(messages) >= repeat_threshold:
+        return True
+    if max_tool_calls > 0 and count_tool_calls(messages) > max_tool_calls:
+        return True
+    return False
+
+
 def source_meta(record: Dict[str, Any]) -> Dict[str, Any]:
     """Carry provenance fields (e.g. __source_task__/__source_agent__) if present."""
     meta = {}
@@ -194,7 +319,7 @@ def build_steps(
 ) -> List[Dict[str, Any]]:
     """Explode one trajectory into per-action ShareGPT step records."""
     messages = record.get("messages") or []
-    goal = (first_role(messages, "user") or "").strip()
+    goal = normalize_goal(first_role(messages, "user"))
     if not goal:
         return []
     goal_line = f"{goal} (traj#{traj_id})" if unique_goal else goal
@@ -306,6 +431,18 @@ def parse_args() -> argparse.Namespace:
                     help="Per-observation cap in native-FC traj output (0 = keep full, recommended).")
     ap.add_argument("--limit", type=int, default=None, help="Process only the first N lines (debug).")
     ap.add_argument("--stats-output", default=None, help="Optional JSON with conversion counts.")
+    ap.add_argument("--keep-duplicates", action="store_true",
+                    help="Keep trajectories that duplicate an earlier one up to timestamps "
+                         "(default: drop the later copies).")
+    ap.add_argument("--keep-loops", action="store_true",
+                    help="Keep looping trajectories (repeated identical tool call, no final "
+                         "answer). Default: drop them.")
+    ap.add_argument("--loop-repeat-threshold", type=int, default=5,
+                    help="One identical (name, arguments) tool call occurring this many times "
+                         "in an answer-less trajectory marks it as looping (0 = disable).")
+    ap.add_argument("--max-tool-calls", type=int, default=0,
+                    help="Also drop answer-less trajectories with more than this many total "
+                         "tool calls (0 = no cap).")
     return ap.parse_args()
 
 
@@ -333,17 +470,40 @@ def main() -> int:
 
     gid = 0  # global trajectory id, unique across all input files
     n_traj = n_steps = n_skipped = n_traj_written = 0
+    n_no_answer = n_dup = n_loop = 0
+    seen_signatures: set = set()
     per_file = []
     try:
         for in_path in in_paths:
-            f_read = f_steps = f_traj = 0
+            f_read = f_steps = f_traj = f_dup = f_loop = 0
             for local_idx, rec in iter_jsonl(in_path):
                 if args.limit is not None and local_idx >= args.limit:
                     break
+                # Every parsed record consumes a _traj_id — including filtered
+                # ones — so ids keep lining up with select_trajectories'
+                # --original-input running index.
                 tid = gid
                 gid += 1
                 n_traj += 1
                 f_read += 1
+                messages = rec.get("messages") or []
+                if not final_answer_text(messages):
+                    # Kept by design: WEASEL selects per step, so answer-less
+                    # episodes still contribute valid tool-calling steps.
+                    n_no_answer += 1
+                if not args.keep_duplicates:
+                    sig = traj_signature(rec)
+                    if sig in seen_signatures:
+                        n_dup += 1
+                        f_dup += 1
+                        continue
+                    seen_signatures.add(sig)
+                if not args.keep_loops and is_looping(
+                    messages, args.loop_repeat_threshold, args.max_tool_calls
+                ):
+                    n_loop += 1
+                    f_loop += 1
+                    continue
                 if want_step:
                     steps = build_steps(
                         rec, tid,
@@ -370,9 +530,11 @@ def main() -> int:
                 if n_traj % 1000 == 0:
                     print(f"[convert_gemini] {n_traj} trajectories...", file=sys.stderr)
             per_file.append({"input": str(in_path), "trajectories_read": f_read,
+                             "dropped_duplicate": f_dup, "dropped_loop": f_loop,
                              "step_records": f_steps if want_step else None,
                              "traj_records": f_traj if want_traj else None})
             print(f"[convert_gemini] done {in_path.name}: read={f_read} "
+                  f"dup={f_dup} loop={f_loop} "
                   f"steps={f_steps if want_step else '-'} traj={f_traj if want_traj else '-'}",
                   file=sys.stderr)
     finally:
@@ -386,6 +548,10 @@ def main() -> int:
         "per_file": per_file,
         "mode": args.mode,
         "trajectories_read": n_traj,
+        "dropped_duplicate": n_dup,
+        "dropped_loop": n_loop,
+        # Monitoring only — answer-less trajectories are kept (step-level selection).
+        "no_final_answer": n_no_answer,
         "step_records_written": n_steps if want_step else None,
         "traj_records_written": n_traj_written if want_traj else None,
         "skipped_empty": n_skipped,
