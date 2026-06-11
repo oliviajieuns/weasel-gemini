@@ -193,11 +193,57 @@ if not final_answer_text(messages):
 
 ---
 
-## 6. 재현 방법
+## 6. 원본 Gemini export 최종 검증 (dit_task_0513, 20,970 traj)
+
+사전 분석의 수치들은 이 파일(`dit_task_0513_gemini_per_line.jsonl`) 기준이었고,
+개선 후 변환에서 **전부 그대로 재현**되었다.
+
+### 6.1 변환 통계
+
+| 항목 | 수치 | 사전 분석과 대조 |
+|---|---|---|
+| 입력 trajectory | **20,970** | |
+| `no_final_answer` | 18,202 (**86.8%**) | **"답변 없음 86.7%" 일치** ✓ — 유지, 카운트만 |
+| `skipped_empty` | 3,466 | 아래 6.2 — **"빈 goal 그룹 3,456" 일치** ✓ |
+| `dropped_duplicate` | 53 | 타임스탬프 중복 (이 export가 해당 이슈의 출처) |
+| `dropped_loop` | 156 | 루핑 trajectory |
+| step 레코드 산출 | **136,100** | WEASEL 선택 입력 |
+| trajectory 레코드 산출 | **17,295** | 20,970 − 53 − 156 − 3,466 ✓ |
+
+### 6.2 "빈 goal 그룹 3,456"의 정체 (확정)
+
+원본 스캔 결과 **user 턴이 아예 없는 trajectory가 정확히 3,456개**
+(`[system, assistant, tool, ...]` 구조, goal 부재). 구 파이프라인에서는 이들이
+모두 빈 goal로 추출되어 한 그룹에 합쳐졌던 것. 추가로 빈 출력(assistant 액션 0)
+26개가 있으며, 3,456 + 26 중 16개는 중복/루핑 필터가 선점 → `skipped_empty`
+3,466 ✓ (전체 회계 일치). 둘 다 학습 타깃이 없어 제외가 정당하다.
+
+### 6.3 멀티 rollout 데이터셋과 `--unique-goal`
+
+이 export는 **같은 task를 평균 ~9회 rollout**한 데이터다. 기본(paper-style)
+goal-텍스트 그룹핑은 rollout들을 한 segment로 병합해 largest segment가
+2,629 step까지 커졌다(O(n²) 재폭발 + segment당 t0=3 예산으로 선택 왜곡).
+`EXTRA_ARGS="--unique-goal"`로 변환하면 rollout 1개 = 그룹 1개가 되어
+논문의 per-trajectory 예산 의미와 일치한다.
+
+### 6.4 selection 단계 최종 확인 (RTX 4090, GPU 검증)
+
+```
+Loaded 136100 datapoints
+Found 17295 distinct goals and 17295 trajectory segments
+(largest segment: 50 steps; pairwise scoring is O(n^2) per segment)
+```
+
+**largest segment 50** — mega-group(3,456 / 2,629) 완전 해소. 처리 속도
+~4.1 goal/s, 전체 약 70분 (roberta-large BERTScore, batch 64).
+
+---
+
+## 7. 재현 방법
 
 ```bash
-# 변환 (필터 기본 적용)
-bash scripts/convert_traindata.sh
+# 변환 (필터 기본 적용; 멀티 rollout export는 --unique-goal 필수)
+EXTRA_ARGS="--unique-goal" bash scripts/convert_traindata.sh
 # 통계 확인
 cat $WEASEL_DATA/gemini_convert_stats.json
 
