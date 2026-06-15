@@ -22,7 +22,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [ -z "${WEASEL_DATA:-}" ]; then
+if [ -z "${WEASEL_DATA:-}" ] || ! type weasel_activate >/dev/null 2>&1; then
   echo "Sourcing scripts/setup_env.sh..."; source scripts/setup_env.sh
 fi
 weasel_activate select 2>/dev/null || weasel_activate train 2>/dev/null || true
@@ -50,9 +50,10 @@ python -m weasel.convert_gemini "${ARGS[@]}" 2>&1 | tee logs/convert_traindata.l
 echo "[convert] done."
 echo "[convert] (a) paper-faithful selection:"
 echo "    TRAIN_INPUT_JSON=$STEPS_OUT bash scripts/run_select.sh --gpus 0"
-echo "    bash scripts/prepare_dataset.sh && bash scripts/run_train.sh --gpus 0"
+echo "    CUTOFF=32768 bash scripts/run_train.sh --gpus 0"
 echo "[convert] (b) real-use trajectory training (optionally WEASEL-filtered):"
 echo "    python -m weasel.select_trajectories \\"
 echo "      --selected-dataset \$WEASEL_TRAIN_JSON --traj-dataset $TRAJ_OUT \\"
-echo "      --output \$LLAMAFACTORY_DIR/data/weasel_gemini_traj.json"
-echo "    DATASET_NAME=weasel_gemini_traj bash scripts/run_train.sh --gpus 0"
+echo "      --output \$WEASEL_DATA/gemini_traj_selected.jsonl"
+echo "    DATA_FILE=\$WEASEL_DATA/gemini_traj_selected.jsonl CUTOFF=32768 bash scripts/run_train.sh --gpus 0"
+echo "[convert] note: CUTOFF=32768 is required — these exports carry a ~20K-token system prompt."
